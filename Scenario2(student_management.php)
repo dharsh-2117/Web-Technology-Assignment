@@ -1,0 +1,552 @@
+<?php
+/*
+ * Student Management System - Single File PHP Project
+ * Requirements: PHP 7.4+ with mysqli and fileinfo, MySQL, Apache.
+ * Create database student_db in phpMyAdmin before opening this page.
+ * Default XAMPP credentials: user=root, password="".
+ */
+
+mysqli_report(MYSQLI_REPORT_OFF);
+
+$conn = new mysqli("localhost", "root", "", "student_db");
+if ($conn->connect_error) {
+    http_response_code(500);
+    exit("Database connection failed. Create the student_db database and check db credentials.");
+}
+$conn->set_charset("utf8mb4");
+
+$conn->query("
+CREATE TABLE IF NOT EXISTS students (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(100) NOT NULL,
+    roll_no VARCHAR(30) NOT NULL UNIQUE,
+    course VARCHAR(100) NOT NULL,
+    email VARCHAR(150) DEFAULT NULL,
+    phone VARCHAR(20) DEFAULT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB
+");
+
+$conn->query("
+CREATE TABLE IF NOT EXISTS student_files (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    student_id INT NOT NULL,
+    original_name VARCHAR(255) NOT NULL,
+    stored_name VARCHAR(100) NOT NULL UNIQUE,
+    file_path VARCHAR(500) NOT NULL,
+    file_type VARCHAR(100) NOT NULL,
+    category VARCHAR(50) NOT NULL,
+    upload_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_student_files_student
+        FOREIGN KEY (student_id) REFERENCES students(id)
+        ON DELETE CASCADE
+) ENGINE=InnoDB
+");
+
+$uploadDir = __DIR__ . DIRECTORY_SEPARATOR . "uploads" . DIRECTORY_SEPARATOR;
+if (!is_dir($uploadDir) && !mkdir($uploadDir, 0755, true) && !is_dir($uploadDir)) {
+    exit("Unable to create uploads folder. Check folder permissions.");
+}
+
+function h($value) {
+    return htmlspecialchars((string)$value, ENT_QUOTES | ENT_SUBSTITUTE, "UTF-8");
+}
+
+function redirectHome($params = array()) {
+    $url = basename($_SERVER["PHP_SELF"]);
+    if ($params) {
+        $url .= "?" . http_build_query($params);
+    }
+    header("Location: " . $url);
+    exit;
+}
+
+function setMessage($text, $type = "success") {
+    $_SESSION["flash_message"] = array("text" => $text, "type" => $type);
+}
+
+if (session_status() !== PHP_SESSION_ACTIVE) {
+    session_start();
+}
+
+/* Handle file viewing/downloading before HTML output. */
+if (isset($_GET["download"])) {
+    $fileId = filter_input(INPUT_GET, "download", FILTER_VALIDATE_INT);
+    if (!$fileId || $fileId < 1) {
+        http_response_code(400);
+        exit("Invalid file ID.");
+    }
+
+    $stmt = $conn->prepare("SELECT original_name, stored_name, file_type FROM student_files WHERE id = ?");
+    $stmt->bind_param("i", $fileId);
+    $stmt->execute();
+    $file = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
+
+    if (!$file) {
+        http_response_code(404);
+        exit("File not found.");
+    }
+
+    $safeStoredName = basename($file["stored_name"]);
+    $path = $uploadDir . $safeStoredName;
+    $allowedMime = array("image/jpeg", "image/png", "application/pdf");
+
+    if (!is_file($path) || !in_array($file["file_type"], $allowedMime, true)) {
+        http_response_code(404);
+        exit("File is missing or its type is not allowed.");
+    }
+
+    $downloadName = preg_replace('/[^A-Za-z0-9._-]/', '_', basename($file["original_name"]));
+    $disposition = (isset($_GET["download_as"]) && $_GET["download_as"] === "attachment")
+        ? "attachment" : "inline";
+
+    header("Content-Type: " . $file["file_type"]);
+    header("X-Content-Type-Options: nosniff");
+    header("Content-Disposition: " . $disposition . '; filename="' . $downloadName . '"');
+    header("Content-Length: " . filesize($path));
+    readfile($path);
+    exit;
+}
+
+/* Simple CSRF token for form submissions. */
+if (empty($_SESSION["csrf_token"])) {
+    $_SESSION["csrf_token"] = bin2hex(random_bytes(32));
+}
+
+$message = "";
+$messageType = "success";
+
+if (!empty($_SESSION["flash_message"])) {
+    $message = $_SESSION["flash_message"]["text"];
+    $messageType = $_SESSION["flash_message"]["type"];
+    unset($_SESSION["flash_message"]);
+}
+
+$allowedCategories = array("Profile Image", "ID Proof", "Certificate", "Other Document");
+$allowedMime = array(
+    "image/jpeg" => "jpg",
+    "image/png" => "png",
+    "application/pdf" => "pdf"
+);
+
+/* Process POST actions. */
+if ($_SERVER["REQUEST_METHOD"] === "POST") {
+    $postedToken = $_POST["csrf_token"] ?? "";
+    if (!is_string($postedToken) || !hash_equals($_SESSION["csrf_token"], $postedToken)) {
+        $message = "Invalid form token. Refresh the page and try again.";
+        $messageType = "error";
+    } else {
+        $action = $_POST["action"] ?? "";
+
+        if ($action === "save_student") {
+            $id = filter_var($_POST["id"] ?? 0, FILTER_VALIDATE_INT);
+            $id = $id ? (int)$id : 0;
+            $name = trim($_POST["name"] ?? "");
+            $roll = trim($_POST["roll_no"] ?? "");
+            $course = trim($_POST["course"] ?? "");
+            $email = trim($_POST["email"] ?? "");
+            $phone = trim($_POST["phone"] ?? "");
+
+            if ($name === "" || $roll === "" || $course === "") {
+                $message = "Name, roll number and course are required.";
+                $messageType = "error";
+            } elseif (mb_strlen($name) > 100 || mb_strlen($roll) > 30 ||
+                      mb_strlen($course) > 100 || mb_strlen($email) > 150 ||
+                      mb_strlen($phone) > 20) {
+                $message = "One or more fields exceed the allowed length.";
+                $messageType = "error";
+            } elseif ($email !== "" && !filter_var($email, FILTER_VALIDATE_EMAIL)) {
+                $message = "Please enter a valid email address.";
+                $messageType = "error";
+            } else {
+                if ($id > 0) {
+                    $stmt = $conn->prepare("UPDATE students SET name=?, roll_no=?, course=?, email=?, phone=? WHERE id=?");
+                    $stmt->bind_param("sssssi", $name, $roll, $course, $email, $phone, $id);
+                } else {
+                    $stmt = $conn->prepare("INSERT INTO students (name, roll_no, course, email, phone) VALUES (?, ?, ?, ?, ?)");
+                    $stmt->bind_param("sssss", $name, $roll, $course, $email, $phone);
+                }
+
+                if ($stmt->execute()) {
+                    $savedId = $id > 0 ? $id : $conn->insert_id;
+                    $stmt->close();
+                    setMessage($id > 0 ? "Student updated successfully." : "Student added successfully.");
+                    redirectHome(array("view" => $savedId));
+                } else {
+                    $message = ($stmt->errno === 1062)
+                        ? "That roll number already exists. Use a unique roll number."
+                        : "Unable to save student. Please try again.";
+                    $messageType = "error";
+                    $stmt->close();
+                }
+            }
+        } elseif ($action === "upload_file") {
+            $studentId = filter_var($_POST["student_id"] ?? 0, FILTER_VALIDATE_INT);
+            $studentId = $studentId ? (int)$studentId : 0;
+            $category = $_POST["category"] ?? "";
+
+            $stmt = $conn->prepare("SELECT id FROM students WHERE id = ?");
+            $stmt->bind_param("i", $studentId);
+            $stmt->execute();
+            $studentExists = (bool)$stmt->get_result()->fetch_assoc();
+            $stmt->close();
+
+            if (!$studentExists) {
+                $message = "Student not found.";
+                $messageType = "error";
+            } elseif (!in_array($category, $allowedCategories, true)) {
+                $message = "Please select a valid file category.";
+                $messageType = "error";
+            } elseif (!isset($_FILES["student_file"])) {
+                $message = "Please select a file.";
+                $messageType = "error";
+            } else {
+                $file = $_FILES["student_file"];
+                $maxSize = 2 * 1024 * 1024; // 2 MB
+
+                if ($file["error"] !== UPLOAD_ERR_OK) {
+                    $message = "Upload failed. Check PHP upload limits and try again.";
+                    $messageType = "error";
+                } elseif ($file["size"] <= 0 || $file["size"] > $maxSize) {
+                    $message = "File size must be greater than 0 and no more than 2 MB.";
+                    $messageType = "error";
+                } elseif (!is_uploaded_file($file["tmp_name"])) {
+                    $message = "Invalid uploaded file.";
+                    $messageType = "error";
+                } else {
+                    $finfo = new finfo(FILEINFO_MIME_TYPE);
+                    $mime = $finfo->file($file["tmp_name"]);
+
+                    if (!isset($allowedMime[$mime])) {
+                        $message = "Only JPG, PNG and PDF files are allowed.";
+                        $messageType = "error";
+                    } elseif ($category === "Profile Image" &&
+                              !in_array($mime, array("image/jpeg", "image/png"), true)) {
+                        $message = "Profile images must be JPG or PNG.";
+                        $messageType = "error";
+                    } else {
+                        $storedName = bin2hex(random_bytes(16)) . "." . $allowedMime[$mime];
+                        $destination = $uploadDir . $storedName;
+                        $relativePath = "uploads/" . $storedName;
+                        $originalName = basename($file["name"]);
+
+                        if (!move_uploaded_file($file["tmp_name"], $destination)) {
+                            $message = "Unable to save the uploaded file. Check folder permissions.";
+                            $messageType = "error";
+                        } else {
+                            $stmt = $conn->prepare(
+                                "INSERT INTO student_files (student_id, original_name, stored_name, file_path, file_type, category)
+                                 VALUES (?, ?, ?, ?, ?, ?)"
+                            );
+                            $stmt->bind_param("isssss", $studentId, $originalName, $storedName, $relativePath, $mime, $category);
+
+                            if ($stmt->execute()) {
+                                $stmt->close();
+                                setMessage("File uploaded successfully.");
+                                redirectHome(array("view" => $studentId));
+                            } else {
+                                $stmt->close();
+                                if (is_file($destination)) {
+                                    unlink($destination);
+                                }
+                                $message = "Unable to save file metadata in the database.";
+                                $messageType = "error";
+                            }
+                        }
+                    }
+                }
+            }
+        } elseif ($action === "delete_file") {
+            $fileId = filter_var($_POST["file_id"] ?? 0, FILTER_VALIDATE_INT);
+            $fileId = $fileId ? (int)$fileId : 0;
+
+            $stmt = $conn->prepare("SELECT student_id, stored_name FROM student_files WHERE id = ?");
+            $stmt->bind_param("i", $fileId);
+            $stmt->execute();
+            $file = $stmt->get_result()->fetch_assoc();
+            $stmt->close();
+
+            if (!$file) {
+                $message = "File not found.";
+                $messageType = "error";
+            } else {
+                $path = $uploadDir . basename($file["stored_name"]);
+                $stmt = $conn->prepare("DELETE FROM student_files WHERE id = ?");
+                $stmt->bind_param("i", $fileId);
+                $ok = $stmt->execute();
+                $stmt->close();
+
+                if ($ok) {
+                    if (is_file($path)) {
+                        unlink($path);
+                    }
+                    setMessage("Uploaded file deleted.");
+                    redirectHome(array("view" => (int)$file["student_id"]));
+                } else {
+                    $message = "Unable to delete file metadata.";
+                    $messageType = "error";
+                }
+            }
+        } elseif ($action === "delete_student") {
+            $id = filter_var($_POST["id"] ?? 0, FILTER_VALIDATE_INT);
+            $id = $id ? (int)$id : 0;
+
+            $stmt = $conn->prepare("SELECT id FROM students WHERE id = ?");
+            $stmt->bind_param("i", $id);
+            $stmt->execute();
+            $exists = (bool)$stmt->get_result()->fetch_assoc();
+            $stmt->close();
+
+            if (!$exists) {
+                $message = "Student not found.";
+                $messageType = "error";
+            } else {
+                // Remove physical files first, then delete student and cascading metadata.
+                $stmt = $conn->prepare("SELECT stored_name FROM student_files WHERE student_id = ?");
+                $stmt->bind_param("i", $id);
+                $stmt->execute();
+                $resultFiles = $stmt->get_result();
+                $storedNames = array();
+                while ($f = $resultFiles->fetch_assoc()) {
+                    $storedNames[] = basename($f["stored_name"]);
+                }
+                $stmt->close();
+
+                $stmt = $conn->prepare("DELETE FROM students WHERE id = ?");
+                $stmt->bind_param("i", $id);
+                if ($stmt->execute()) {
+                    $stmt->close();
+                    foreach ($storedNames as $stored) {
+                        $path = $uploadDir . $stored;
+                        if (is_file($path)) {
+                            unlink($path);
+                        }
+                    }
+                    setMessage("Student and associated file records deleted.");
+                    redirectHome();
+                } else {
+                    $stmt->close();
+                    $message = "Unable to delete student.";
+                    $messageType = "error";
+                }
+            }
+        }
+    }
+}
+
+/* Load edit/view data. */
+$editStudent = null;
+if (isset($_GET["edit"])) {
+    $editId = filter_input(INPUT_GET, "edit", FILTER_VALIDATE_INT);
+    if ($editId && $editId > 0) {
+        $stmt = $conn->prepare("SELECT * FROM students WHERE id = ?");
+        $stmt->bind_param("i", $editId);
+        $stmt->execute();
+        $editStudent = $stmt->get_result()->fetch_assoc();
+        $stmt->close();
+        if (!$editStudent) {
+            $message = "Student not found.";
+            $messageType = "error";
+        }
+    }
+}
+
+$viewStudent = null;
+$filesResult = null;
+if (isset($_GET["view"])) {
+    $viewId = filter_input(INPUT_GET, "view", FILTER_VALIDATE_INT);
+    if ($viewId && $viewId > 0) {
+        $stmt = $conn->prepare("SELECT * FROM students WHERE id = ?");
+        $stmt->bind_param("i", $viewId);
+        $stmt->execute();
+        $viewStudent = $stmt->get_result()->fetch_assoc();
+        $stmt->close();
+
+        if ($viewStudent) {
+            $stmt = $conn->prepare("SELECT * FROM student_files WHERE student_id = ? ORDER BY upload_date DESC");
+            $stmt->bind_param("i", $viewId);
+            $stmt->execute();
+            $filesResult = $stmt->get_result();
+        } else {
+            $message = "Student not found.";
+            $messageType = "error";
+        }
+    }
+}
+
+$studentsResult = $conn->query("SELECT * FROM students ORDER BY id DESC");
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Student Management System</title>
+<style>
+    body { font-family: Arial, sans-serif; margin: 24px auto; padding: 0 14px; max-width: 1200px; background: #f3f5f8; color: #222; }
+    h1, h2, h3 { color: #20364d; }
+    .box { background: #fff; padding: 20px; margin: 18px 0; border-radius: 9px; box-shadow: 0 2px 8px rgba(0,0,0,.07); }
+    label { display: block; margin-top: 10px; font-weight: bold; }
+    input, select { box-sizing: border-box; max-width: 100%; width: 320px; padding: 9px; margin-top: 5px; }
+    button, .button { display: inline-block; padding: 8px 12px; margin-top: 8px; border: 0; border-radius: 4px; background: #245b8f; color: white; text-decoration: none; cursor: pointer; }
+    .danger { background: #b52d36; }
+    .muted { background: #666; }
+    table { border-collapse: collapse; width: 100%; background: #fff; }
+    th, td { border: 1px solid #d4d9df; padding: 9px; text-align: left; vertical-align: top; }
+    th { background: #e8edf2; }
+    .table-wrap { overflow-x: auto; }
+    .message { padding: 12px; border-radius: 5px; margin: 12px 0; }
+    .success { background: #e4f7e8; color: #155724; }
+    .error { background: #fde8e8; color: #842029; }
+    .actions { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+    .actions form { margin: 0; }
+    .note { color: #555; font-size: .94em; }
+</style>
+</head>
+<body>
+
+<h1>Student Management System</h1>
+<p class="note">Manage student records and upload profile images, ID proofs and certificates. Maximum upload size: 2 MB. Allowed types: JPG, PNG and PDF.</p>
+
+<?php if ($message !== ""): ?>
+    <div class="message <?= h($messageType) ?>"><?= h($message) ?></div>
+<?php endif; ?>
+
+<section class="box" id="student-form">
+    <h2><?= $editStudent ? "Edit Student" : "Add New Student" ?></h2>
+    <form method="post" action="<?= h(basename($_SERVER["PHP_SELF"])) ?>#student-form">
+        <input type="hidden" name="csrf_token" value="<?= h($_SESSION["csrf_token"]) ?>">
+        <input type="hidden" name="action" value="save_student">
+        <input type="hidden" name="id" value="<?= (int)($editStudent["id"] ?? 0) ?>">
+
+        <label for="name">Name *</label>
+        <input id="name" name="name" maxlength="100" required value="<?= h($editStudent["name"] ?? "") ?>">
+
+        <label for="roll_no">Roll Number *</label>
+        <input id="roll_no" name="roll_no" maxlength="30" required value="<?= h($editStudent["roll_no"] ?? "") ?>">
+
+        <label for="course">Course *</label>
+        <input id="course" name="course" maxlength="100" required value="<?= h($editStudent["course"] ?? "") ?>">
+
+        <label for="email">Email</label>
+        <input id="email" type="email" name="email" maxlength="150" value="<?= h($editStudent["email"] ?? "") ?>">
+
+        <label for="phone">Phone</label>
+        <input id="phone" name="phone" maxlength="20" value="<?= h($editStudent["phone"] ?? "") ?>">
+
+        <br>
+        <button type="submit"><?= $editStudent ? "Update Student" : "Add Student" ?></button>
+        <?php if ($editStudent): ?>
+            <a class="button muted" href="<?= h(basename($_SERVER["PHP_SELF"])) ?>">Cancel</a>
+        <?php endif; ?>
+    </form>
+</section>
+
+<section class="box">
+    <h2>All Students</h2>
+    <div class="table-wrap">
+    <table>
+        <thead>
+        <tr><th>ID</th><th>Name</th><th>Roll Number</th><th>Course</th><th>Email</th><th>Phone</th><th>Actions</th></tr>
+        </thead>
+        <tbody>
+        <?php if ($studentsResult && $studentsResult->num_rows > 0): ?>
+            <?php while ($student = $studentsResult->fetch_assoc()): ?>
+                <tr>
+                    <td><?= (int)$student["id"] ?></td>
+                    <td><?= h($student["name"]) ?></td>
+                    <td><?= h($student["roll_no"]) ?></td>
+                    <td><?= h($student["course"]) ?></td>
+                    <td><?= h($student["email"] ?? "") ?></td>
+                    <td><?= h($student["phone"] ?? "") ?></td>
+                    <td>
+                        <div class="actions">
+                            <a class="button" href="?view=<?= (int)$student["id"] ?>">View</a>
+                            <a class="button muted" href="?edit=<?= (int)$student["id"] ?>#student-form">Edit</a>
+                            <form method="post" onsubmit="return confirm('Delete this student and all associated uploads?');">
+                                <input type="hidden" name="csrf_token" value="<?= h($_SESSION["csrf_token"]) ?>">
+                                <input type="hidden" name="action" value="delete_student">
+                                <input type="hidden" name="id" value="<?= (int)$student["id"] ?>">
+                                <button class="danger" type="submit">Delete</button>
+                            </form>
+                        </div>
+                    </td>
+                </tr>
+            <?php endwhile; ?>
+        <?php else: ?>
+            <tr><td colspan="7">No students found. Use the form above to add a student.</td></tr>
+        <?php endif; ?>
+        </tbody>
+    </table>
+    </div>
+</section>
+
+<?php if ($viewStudent): ?>
+<section class="box">
+    <h2>Student Details: <?= h($viewStudent["name"]) ?></h2>
+    <p><strong>Roll Number:</strong> <?= h($viewStudent["roll_no"]) ?></p>
+    <p><strong>Course:</strong> <?= h($viewStudent["course"]) ?></p>
+    <p><strong>Email:</strong> <?= h($viewStudent["email"] ?? "") ?></p>
+    <p><strong>Phone:</strong> <?= h($viewStudent["phone"] ?? "") ?></p>
+
+    <h3>Upload Profile Image or Document</h3>
+    <form method="post" enctype="multipart/form-data">
+        <input type="hidden" name="csrf_token" value="<?= h($_SESSION["csrf_token"]) ?>">
+        <input type="hidden" name="action" value="upload_file">
+        <input type="hidden" name="student_id" value="<?= (int)$viewStudent["id"] ?>">
+
+        <label for="student_file">Choose file (JPG, PNG or PDF; max 2 MB)</label>
+        <input id="student_file" type="file" name="student_file" accept=".jpg,.jpeg,.png,.pdf" required>
+
+        <label for="category">File Category</label>
+        <select id="category" name="category" required>
+            <option value="Profile Image">Profile Image</option>
+            <option value="ID Proof">ID Proof</option>
+            <option value="Certificate">Certificate</option>
+            <option value="Other Document">Other Document</option>
+        </select>
+        <br>
+        <button type="submit">Upload File</button>
+    </form>
+
+    <h3>Uploaded Files</h3>
+    <div class="table-wrap">
+    <table>
+        <thead><tr><th>Original File Name</th><th>Category</th><th>MIME Type</th><th>Upload Date</th><th>Actions</th></tr></thead>
+        <tbody>
+        <?php if ($filesResult && $filesResult->num_rows > 0): ?>
+            <?php while ($f = $filesResult->fetch_assoc()): ?>
+                <tr>
+                    <td><?= h($f["original_name"]) ?></td>
+                    <td><?= h($f["category"]) ?></td>
+                    <td><?= h($f["file_type"]) ?></td>
+                    <td><?= h($f["upload_date"]) ?></td>
+                    <td>
+                        <div class="actions">
+                            <a class="button" target="_blank" rel="noopener" href="?download=<?= (int)$f["id"] ?>">View</a>
+                            <a class="button muted" href="?download=<?= (int)$f["id"] ?>&amp;download_as=attachment">Download</a>
+                            <form method="post" onsubmit="return confirm('Delete this uploaded file?');">
+                                <input type="hidden" name="csrf_token" value="<?= h($_SESSION["csrf_token"]) ?>">
+                                <input type="hidden" name="action" value="delete_file">
+                                <input type="hidden" name="file_id" value="<?= (int)$f["id"] ?>">
+                                <button class="danger" type="submit">Delete File</button>
+                            </form>
+                        </div>
+                    </td>
+                </tr>
+            <?php endwhile; ?>
+        <?php else: ?>
+            <tr><td colspan="5">No files uploaded for this student.</td></tr>
+        <?php endif; ?>
+        </tbody>
+    </table>
+    </div>
+</section>
+<?php endif; ?>
+
+<footer class="note">
+    <p>Web Technology project: PHP + MySQL CRUD, file upload validation, metadata storage, and file viewing/downloading.</p>
+</footer>
+</body>
+</html>

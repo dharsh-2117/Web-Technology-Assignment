@@ -1,0 +1,1 @@
+Put test images/PDFs in your configured UPLOAD_DIR. Do not commit real student documents to GitHub.\n
